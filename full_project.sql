@@ -286,6 +286,41 @@ FOR EACH ROW
 EXECUTE FUNCTION fn_auto_add_manager_group();
 
 -- ---------------------------------------------------------
+-- Trigger 4b: auto-remove manager from Managers group on role removal
+-- ---------------------------------------------------------
+CREATE OR REPLACE FUNCTION fn_auto_remove_manager_group()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_manager_role_id INTEGER;
+    v_group_id INTEGER;
+BEGIN
+    SELECT role_id INTO v_manager_role_id
+    FROM role
+    WHERE lower(name) = 'project manager';
+
+    SELECT gr_id INTO v_group_id
+    FROM user_group
+    WHERE lower(name) = 'managers';
+
+    IF v_manager_role_id IS NOT NULL
+       AND v_group_id IS NOT NULL
+       AND OLD.role_id = v_manager_role_id THEN
+        DELETE FROM group_membership
+        WHERE gr_id = v_group_id AND emp_id = OLD.emp_id;
+    END IF;
+
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_auto_remove_manager_group
+AFTER DELETE ON employee_role
+FOR EACH ROW
+EXECUTE FUNCTION fn_auto_remove_manager_group();
+
+-- ---------------------------------------------------------
 -- View required by project brief
 -- ---------------------------------------------------------
 CREATE OR REPLACE VIEW vw_project_overview AS
@@ -298,16 +333,12 @@ SELECT
     c.email AS customer_email,
     co.start_date,
     co.deadline,
-    d.name AS department_name,
     l.city AS delivery_city,
     l.country
 FROM project p
 JOIN commissions co ON co.pr_id = p.pr_id
 JOIN customer c ON c.cid = co.cid
-LEFT JOIN works_on w ON w.pr_id = p.pr_id
-LEFT JOIN employee e ON e.emp_id = w.emp_id
-LEFT JOIN department d ON d.dep_id = e.dep_id
-LEFT JOIN location l ON l.lid = c.lid;
+JOIN location l ON l.lid = c.lid;
 
 -- ---------------------------------------------------------
 -- Bonus indexes
@@ -452,6 +483,7 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA bidi TO bidi_admin_role;
 GRANT SELECT ON ALL TABLES IN SCHEMA bidi TO bidi_manager_role;
 GRANT INSERT, UPDATE, DELETE ON project, commissions, works_on, employee_role, group_membership
 TO bidi_manager_role;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA bidi TO bidi_manager_role;
 
 -- Customer role can only read project overview view
 REVOKE ALL ON ALL TABLES IN SCHEMA bidi FROM bidi_customer_role;
@@ -480,13 +512,62 @@ GRANT bidi_manager_role TO bidi_manager_user;
 GRANT bidi_customer_role TO bidi_customer_user;
 
 -- Example demo commands
--- SET ROLE bidi_customer_user;
--- SELECT * FROM bidi.vw_project_overview;             -- authorized
--- SELECT * FROM bidi.employee;                        -- unauthorized
---
--- SET ROLE bidi_manager_user;
--- UPDATE bidi.project SET status = 'ACTIVE' WHERE pr_id = 3; -- authorized
--- DELETE FROM bidi.customer WHERE cid = 1;                  -- unauthorized (no delete grant)
+-- ---------------------------------------------------------
+-- Permission matrix: shows what each role can and cannot do
+-- ---------------------------------------------------------
+SELECT
+    r.role_name,
+    has_table_privilege(r.role_name, 'bidi.vw_project_overview', 'SELECT') AS can_view_overview,
+    has_table_privilege(r.role_name, 'bidi.employee',            'SELECT') AS can_read_employee,
+    has_table_privilege(r.role_name, 'bidi.project',             'INSERT') AS can_insert_project,
+    has_table_privilege(r.role_name, 'bidi.customer',            'DELETE') AS can_delete_customer
+FROM (VALUES
+    ('bidi_customer_role'::text),
+    ('bidi_manager_role'::text),
+    ('bidi_admin_role'::text)
+) AS r(role_name);
+
+-- ---------------------------------------------------------
+-- AUTHORIZED: customer role reads project overview view
+-- ---------------------------------------------------------
+BEGIN;
+SET LOCAL ROLE bidi_customer_role;
+SELECT pr_id, project_name, status, deadline
+FROM bidi.vw_project_overview
+ORDER BY pr_id;
+ROLLBACK;
+
+-- ---------------------------------------------------------
+-- AUTHORIZED: manager role updates a project status
+-- ---------------------------------------------------------
+BEGIN;
+SET LOCAL ROLE bidi_manager_role;
+UPDATE bidi.project SET status = 'ACTIVE' WHERE pr_id = 3;
+ROLLBACK;
+
+-- ---------------------------------------------------------
+-- UNAUTHORIZED: verified via privilege functions
+-- ---------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT has_table_privilege('bidi_customer_role', 'bidi.employee', 'SELECT') THEN
+        RAISE NOTICE 'VERIFIED: bidi_customer_role denied SELECT on employee table';
+    ELSE
+        RAISE NOTICE 'UNEXPECTED: bidi_customer_role has SELECT on employee table';
+    END IF;
+
+    IF NOT has_table_privilege('bidi_manager_role', 'bidi.customer', 'DELETE') THEN
+        RAISE NOTICE 'VERIFIED: bidi_manager_role denied DELETE on customer table';
+    ELSE
+        RAISE NOTICE 'UNEXPECTED: bidi_manager_role has DELETE on customer table';
+    END IF;
+
+    IF NOT has_table_privilege('bidi_customer_role', 'bidi.project', 'INSERT') THEN
+        RAISE NOTICE 'VERIFIED: bidi_customer_role denied INSERT on project table';
+    ELSE
+        RAISE NOTICE 'UNEXPECTED: bidi_customer_role has INSERT on project table';
+    END IF;
+END $$;
 
 
 -- ===== END 06_access_control.sql =====
@@ -622,41 +703,71 @@ SET search_path TO bidi;
 
 -- 1) CHECK constraint failure: invalid budget
 -- Expected: rejected because budget must be > 0
-INSERT INTO project(name, budget, status)
-VALUES ('Invalid Budget Project', -1000, 'PLANNED');
+DO $$ BEGIN
+    INSERT INTO project(name, budget, status)
+    VALUES ('Invalid Budget Project', -1000, 'PLANNED');
+    RAISE NOTICE 'TEST 1 FAILED – insert should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'TEST 1 PASSED – rejected as expected: %', SQLERRM;
+END $$;
 
 -- 2) CHECK constraint failure: invalid status
 -- Expected: rejected because status is limited to the allowed set
-INSERT INTO project(name, budget, status)
-VALUES ('Bad Status Project', 5000, 'RUNNING');
+DO $$ BEGIN
+    INSERT INTO project(name, budget, status)
+    VALUES ('Bad Status Project', 5000, 'RUNNING');
+    RAISE NOTICE 'TEST 2 FAILED – insert should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'TEST 2 PASSED – rejected as expected: %', SQLERRM;
+END $$;
 
 -- 3) UNIQUE constraint failure: duplicate employee email
 -- Expected: rejected
-INSERT INTO employee(dep_id, email, name)
-VALUES (1, 'alice.virtanen@bidi.fi', 'Duplicate Alice');
+DO $$ BEGIN
+    INSERT INTO employee(dep_id, email, name)
+    VALUES (1, 'alice.virtanen@bidi.fi', 'Duplicate Alice');
+    RAISE NOTICE 'TEST 3 FAILED – insert should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'TEST 3 PASSED – rejected as expected: %', SQLERRM;
+END $$;
 
 -- 4) FK failure: missing department
 -- Expected: rejected
-INSERT INTO employee(dep_id, email, name)
-VALUES (999, 'ghost@bidi.fi', 'Ghost Employee');
+DO $$ BEGIN
+    INSERT INTO employee(dep_id, email, name)
+    VALUES (999, 'ghost@bidi.fi', 'Ghost Employee');
+    RAISE NOTICE 'TEST 4 FAILED – insert should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'TEST 4 PASSED – rejected as expected: %', SQLERRM;
+END $$;
 
 -- 5) Trigger failure: deadline earlier than start date
 -- Expected: rejected by trg_validate_commission_dates
-INSERT INTO project(name, budget, status)
-VALUES ('Commission Date Test', 10000, 'PLANNED');
+DO $$ BEGIN
+    INSERT INTO project(name, budget, status)
+    VALUES ('Commission Date Test', 10000, 'PLANNED');
 
-INSERT INTO commissions(pr_id, cid, start_date, deadline)
-VALUES (
-    (SELECT pr_id FROM project WHERE name = 'Commission Date Test'),
-    1,
-    DATE '2026-06-10',
-    DATE '2026-06-05'
-);
+    INSERT INTO commissions(pr_id, cid, start_date, deadline)
+    VALUES (
+        (SELECT pr_id FROM project WHERE name = 'Commission Date Test'),
+        1,
+        DATE '2026-06-10',
+        DATE '2026-06-05'
+    );
+    RAISE NOTICE 'TEST 5 FAILED – insert should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'TEST 5 PASSED – rejected as expected: %', SQLERRM;
+END $$;
 
 -- 6) Trigger failure: assignment after deadline
 -- Expected: rejected by trg_check_project_deadline_before_assignment
-INSERT INTO works_on(pr_id, emp_id, started, allocation_pct)
-VALUES (1, 3, DATE '2027-01-01', 20.00);
+DO $$ BEGIN
+    INSERT INTO works_on(pr_id, emp_id, started, allocation_pct)
+    VALUES (1, 3, DATE '2027-01-01', 20.00);
+    RAISE NOTICE 'TEST 6 FAILED – insert should have been rejected';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'TEST 6 PASSED – rejected as expected: %', SQLERRM;
+END $$;
 
 
 -- ===== END 05_constraint_and_trigger_failure_tests.sql =====
